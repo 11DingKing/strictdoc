@@ -168,6 +168,7 @@ from strictdoc.helpers.string import (
     sanitize_html_form_field,
 )
 from strictdoc.helpers.timing import measure_performance
+from strictdoc.server.document_creation import DocumentCreationCommit
 from strictdoc.server.document_watcher import (
     DocumentWatcher,
     get_watched_document_extensions,
@@ -3235,6 +3236,31 @@ def create_main_router(
                         "and underscore symbols."
                     ),
                 )
+            else:
+                assert isinstance(project_config.input_paths, list)
+                full_input_path = os.path.abspath(
+                    project_config.input_paths[0]
+                )
+                candidate_full_path = os.path.abspath(
+                    os.path.join(full_input_path, document_path)
+                )
+                try:
+                    path_is_within_input_folder = (
+                        os.path.commonpath(
+                            (full_input_path, candidate_full_path)
+                        )
+                        == full_input_path
+                    )
+                except ValueError:
+                    path_is_within_input_folder = False
+                if not path_is_within_input_folder:
+                    error_object.add_error(
+                        "document_path",
+                        (
+                            "Document path must be relative and stay "
+                            "within the input folder."
+                        ),
+                    )
 
         if project_config.include_doc_paths is not None:
             path_filter_includes = PathFilter(
@@ -3298,56 +3324,48 @@ def create_main_router(
                 },
             )
 
-        assert isinstance(project_config.input_paths, list)
-        full_input_path = os.path.abspath(project_config.input_paths[0])
-        file_tree_mount_folder = os.path.basename(
-            os.path.dirname(full_input_path)
+        # The source-file write, the TraceabilityIndex rebuild, the
+        # HTML/PDF export and the tree refresh are a single recoverable
+        # commit. Any failure rolls the created file, directories and index
+        # back and is reported back to the form instead of as a success.
+        document_creation_commit = DocumentCreationCommit(
+            project_config=project_config,
+            export_action=export_action,
+            parallelizer=parallelizer,
+            document_watcher=getattr(app.state, "document_watcher", None),
         )
-        doc_full_path = os.path.join(full_input_path, document_path)
-        doc_full_path_dir = os.path.dirname(doc_full_path)
-        document_file_name = os.path.basename(doc_full_path)
-        input_doc_dir_rel_path = os.path.dirname(document_path)
-        input_doc_assets_dir_rel_path = (
-            "/".join(
-                (
-                    file_tree_mount_folder,
-                    input_doc_dir_rel_path,
-                    "_assets",
-                )
-            )
-            if len(input_doc_dir_rel_path) > 0
-            else "/".join((file_tree_mount_folder, "_assets"))
-        )
-
-        Path(doc_full_path_dir).mkdir(parents=True, exist_ok=True)
-        document = SDocDocument(
-            mid=None,
+        creation_outcome = document_creation_commit.perform(
             title=document_title,
-            config=None,
-            view=None,
-            grammar=DocumentGrammar.create_default(parent=None),
-            section_contents=[],
-        )
-        # FIXME: Fill in the document meta correctly.
-        document.meta = DocumentMeta(
-            level=0,
-            file_tree_mount_folder="NOT_RELEVANT",
-            document_filename=document_file_name,
-            document_filename_base="NOT_RELEVANT",
-            input_doc_full_path=doc_full_path,
-            input_doc_rel_path=SDocRelativePath(document_path),
-            input_doc_dir_rel_path=SDocRelativePath(input_doc_dir_rel_path),
-            input_doc_assets_dir_rel_path=SDocRelativePath(
-                input_doc_assets_dir_rel_path
-            ),
-            output_document_dir_full_path="NOT_RELEVANT",
-            output_document_dir_rel_path=SDocRelativePath("FIXME"),
+            relative_path=document_path,
         )
 
-        write_document_to_file(document)
-
-        export_action.build_index()
-        export_action.export()
+        if not creation_outcome.success:
+            creation_failure = creation_outcome.failure
+            assert creation_failure is not None
+            error_object.add_error(
+                creation_failure.field, creation_failure.message
+            )
+            output = env().render_template_as_markup(
+                "actions/project_index/stream_new_document.jinja.html",
+                error_object=error_object,
+                document_title=document_title
+                if document_title is not None
+                else "",
+                document_path=document_path
+                if document_path is not None
+                else "",
+                include_doc_paths=project_config.include_doc_paths,
+                editable_document_extensions=(
+                    project_config.get_editable_document_extensions()
+                ),
+            )
+            return HTMLResponse(
+                content=output,
+                status_code=200,
+                headers={
+                    "Content-Type": "text/vnd.turbo-stream.html",
+                },
+            )
 
         view_object = ProjectTreeViewObject(
             traceability_index=export_action.traceability_index,

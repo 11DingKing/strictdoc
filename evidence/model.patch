@@ -1,0 +1,1017 @@
+diff --git a/strictdoc/server/document_creation.py b/strictdoc/server/document_creation.py
+new file mode 100644
+index 0000000..07feaa6
+--- /dev/null
++++ b/strictdoc/server/document_creation.py
+@@ -0,0 +1,440 @@
++"""
++Recoverable commit for the Web UI "Add new document" action.
++
++The creation of a document is a single commit spanning four resources:
++
++1. the source document file on disk (plus any missing parent directories);
++2. the in-memory TraceabilityIndex rebuilt from that file;
++3. the HTML/PDF outputs derived from the rebuilt index;
++4. the project tree rendered from the rebuilt index.
++
++The commit either finishes all four stages or leaves the project as it was
++before the commit started. A failure at any stage is reported back to the
++caller as a DocumentCreationOutcome carrying a form-field error; success is
++reported only after every stage succeeds.
++
++The commit is also idempotent: re-submitting a form whose document was
++already created with the very same content refreshes the index and the
++derived outputs without creating a second document and without overwriting
++an unrelated file that happens to share the path.
++"""
++
++import dataclasses
++import os
++import tempfile
++from typing import List, Optional
++
++from strictdoc.backend.markdown.writer import SDMarkdownWriter
++from strictdoc.backend.sdoc.errors.document_tree_error import (
++    DocumentTreeError,
++)
++from strictdoc.backend.sdoc.models.document import SDocDocument
++from strictdoc.backend.sdoc.models.document_grammar import DocumentGrammar
++from strictdoc.backend.sdoc.writer import SDWriter
++from strictdoc.core.document_meta import DocumentMeta
++from strictdoc.core.project_config import ProjectConfig
++from strictdoc.core.traceability_index import TraceabilityIndex
++from strictdoc.core.traceability_index_builder import TraceabilityIndexBuilder
++from strictdoc.features.export.export_action import ExportAction
++from strictdoc.helpers.parallelizer import Parallelizer
++from strictdoc.helpers.paths import SDocRelativePath
++from strictdoc.server.document_watcher import DocumentWatcher
++
++DOCUMENT_PATH_FORM_FIELD = "document_path"
++
++
++@dataclasses.dataclass
++class DocumentCreationFailure:
++    field: str
++    message: str
++
++
++@dataclasses.dataclass
++class DocumentCreationOutcome:
++    success: bool
++    failure: Optional[DocumentCreationFailure]
++    # True when the source file was already present with the exact content
++    # this commit would have written, so the commit only refreshed the index
++    # and the derived outputs (idempotent form re-submission).
++    already_present: bool = False
++
++    @staticmethod
++    def successful(*, already_present: bool) -> "DocumentCreationOutcome":
++        return DocumentCreationOutcome(
++            success=True, failure=None, already_present=already_present
++        )
++
++    @staticmethod
++    def failed(field: str, message: str) -> "DocumentCreationOutcome":
++        return DocumentCreationOutcome(
++            success=False,
++            failure=DocumentCreationFailure(field=field, message=message),
++        )
++
++
++@dataclasses.dataclass
++class _DocumentTarget:
++    relative_path: str
++    full_input_path: str
++    document_full_path: str
++    document_directory: str
++    document_file_name: str
++    input_doc_dir_rel_path: str
++    input_doc_assets_dir_rel_path: str
++
++
++class DocumentCreationCommit:
++    def __init__(
++        self,
++        *,
++        project_config: ProjectConfig,
++        export_action: ExportAction,
++        parallelizer: Parallelizer,
++        document_watcher: Optional[DocumentWatcher],
++    ) -> None:
++        self.project_config: ProjectConfig = project_config
++        self.export_action: ExportAction = export_action
++        self.parallelizer: Parallelizer = parallelizer
++        self.document_watcher: Optional[DocumentWatcher] = document_watcher
++        self.sdoc_writer: SDWriter = SDWriter(project_config)
++
++        # Set to True when the target file already holds exactly the content
++        # this commit would write (an idempotent form re-submission).
++        self._source_already_present: bool = False
++        # Set to True only after the target file is atomically put in place
++        # by this commit; rollback removes the file only in this case.
++        self._source_file_created: bool = False
++        self._created_directories: List[str] = []
++
++    def perform(
++        self, *, title: str, relative_path: str
++    ) -> DocumentCreationOutcome:
++        """
++        Run the commit. Must be called while the server's global write lock
++        is held.
++        """
++
++        self._source_already_present = False
++        self._source_file_created = False
++        self._created_directories = []
++
++        target = self._resolve_target_paths(relative_path)
++        document = self._build_empty_document(title, target)
++        document_content = self._render_document_content(document)
++
++        preflight_failure = self._run_preflight(target, document_content)
++        if preflight_failure is not None:
++            return preflight_failure
++
++        if not self._source_already_present:
++            try:
++                self._stage_source_file(target, document_content)
++            except Exception as error:  # noqa: BLE001
++                self._rollback_created_paths(target)
++                return DocumentCreationOutcome.failed(
++                    DOCUMENT_PATH_FORM_FIELD,
++                    "Could not write the document file at "
++                    f"'{relative_path}': {error}",
++                )
++
++        try:
++            self._commit_rebuilt_index()
++        except DocumentTreeError as error:
++            self._rollback_created_paths(target)
++            return DocumentCreationOutcome.failed(
++                DOCUMENT_PATH_FORM_FIELD,
++                "Failed to rebuild the project index. The created document "
++                "was rolled back. " + error.to_validation_message(),
++            )
++        except Exception as error:  # noqa: BLE001
++            self._rollback_created_paths(target)
++            return DocumentCreationOutcome.failed(
++                DOCUMENT_PATH_FORM_FIELD,
++                "Failed to rebuild the project index. The created document "
++                f"was rolled back. {error}",
++            )
++
++        try:
++            self.export_action.export()
++        except Exception as export_error:  # noqa: BLE001
++            self._recover_after_failed_export(target)
++            return DocumentCreationOutcome.failed(
++                DOCUMENT_PATH_FORM_FIELD,
++                "Failed to generate the HTML/PDF outputs. The created "
++                f"document was rolled back. {export_error}",
++            )
++
++        return DocumentCreationOutcome.successful(
++            already_present=self._source_already_present
++        )
++
++    def _resolve_target_paths(self, relative_path: str) -> _DocumentTarget:
++        assert isinstance(self.project_config.input_paths, list)
++        full_input_path = os.path.abspath(self.project_config.input_paths[0])
++        document_full_path = os.path.join(full_input_path, relative_path)
++        document_directory = os.path.dirname(document_full_path)
++        document_file_name = os.path.basename(document_full_path)
++        input_doc_dir_rel_path = os.path.dirname(relative_path)
++        file_tree_mount_folder = os.path.basename(
++            os.path.dirname(full_input_path)
++        )
++        if len(input_doc_dir_rel_path) > 0:
++            input_doc_assets_dir_rel_path = "/".join(
++                (
++                    file_tree_mount_folder,
++                    input_doc_dir_rel_path,
++                    "_assets",
++                )
++            )
++        else:
++            input_doc_assets_dir_rel_path = "/".join(
++                (file_tree_mount_folder, "_assets")
++            )
++        return _DocumentTarget(
++            relative_path=relative_path,
++            full_input_path=full_input_path,
++            document_full_path=document_full_path,
++            document_directory=document_directory,
++            document_file_name=document_file_name,
++            input_doc_dir_rel_path=input_doc_dir_rel_path,
++            input_doc_assets_dir_rel_path=input_doc_assets_dir_rel_path,
++        )
++
++    def _build_empty_document(
++        self, title: str, target: _DocumentTarget
++    ) -> SDocDocument:
++        document = SDocDocument(
++            mid=None,
++            title=title,
++            config=None,
++            view=None,
++            grammar=DocumentGrammar.create_default(parent=None),
++            section_contents=[],
++        )
++        # FIXME: Fill in the document meta correctly.
++        document.meta = DocumentMeta(
++            level=0,
++            file_tree_mount_folder="NOT_RELEVANT",
++            document_filename=target.document_file_name,
++            document_filename_base="NOT_RELEVANT",
++            input_doc_full_path=target.document_full_path,
++            input_doc_rel_path=SDocRelativePath(target.relative_path),
++            input_doc_dir_rel_path=SDocRelativePath(
++                target.input_doc_dir_rel_path
++            ),
++            input_doc_assets_dir_rel_path=SDocRelativePath(
++                target.input_doc_assets_dir_rel_path
++            ),
++            output_document_dir_full_path="NOT_RELEVANT",
++            output_document_dir_rel_path=SDocRelativePath("FIXME"),
++        )
++        return document
++
++    def _render_document_content(self, document: SDocDocument) -> str:
++        assert document.meta is not None
++        if document.meta.input_doc_full_path.lower().endswith(
++            (".md", ".markdown")
++        ):
++            return SDMarkdownWriter.write(
++                document,
++                line_width=self.project_config.document_line_width,
++            )
++        return self.sdoc_writer.write(document)
++
++    # The preflight is read-only: it must not create directories or files, so
++    # that a rejected commit has nothing to clean up.
++    def _run_preflight(
++        self, target: _DocumentTarget, document_content: str
++    ) -> Optional[DocumentCreationOutcome]:
++        ancestor_failure = self._validate_existing_ancestors(target)
++        if ancestor_failure is not None:
++            return ancestor_failure
++
++        if not os.path.lexists(target.document_full_path):
++            self._source_already_present = False
++            return None
++
++        try:
++            is_directory = os.path.isdir(target.document_full_path)
++            with open(
++                target.document_full_path, "rb"
++            ) as existing_document_file:
++                existing_content = existing_document_file.read()
++        except OSError as error:
++            return DocumentCreationOutcome.failed(
++                DOCUMENT_PATH_FORM_FIELD,
++                "Could not access the document file at "
++                f"'{target.document_full_path}': {error}",
++            )
++
++        if (
++            not is_directory
++            and existing_content == document_content.encode("utf8")
++        ):
++            # Idempotent re-submission of the same form: the file already
++            # contains exactly what this commit would write.
++            self._source_already_present = True
++            return None
++
++        return DocumentCreationOutcome.failed(
++            DOCUMENT_PATH_FORM_FIELD,
++            "A document already exists at this path. Choose another path "
++            "or remove the existing file first.",
++        )
++
++    def _validate_existing_ancestors(
++        self, target: _DocumentTarget
++    ) -> Optional[DocumentCreationOutcome]:
++        current_path = target.document_directory
++        while not os.path.isdir(current_path):
++            if os.path.lexists(current_path):
++                return DocumentCreationOutcome.failed(
++                    DOCUMENT_PATH_FORM_FIELD,
++                    f"'{current_path}' exists and is not a directory.",
++                )
++            parent_path = os.path.dirname(current_path)
++            if parent_path == current_path:
++                break
++            current_path = parent_path
++        return None
++
++    def _stage_source_file(
++        self, target: _DocumentTarget, document_content: str
++    ) -> None:
++        self._created_directories = self._create_missing_directories(target)
++
++        self._inhibit_watcher(target.document_full_path)
++
++        temporary_file_descriptor, temporary_file_path = tempfile.mkstemp(
++            prefix="." + target.document_file_name + ".",
++            suffix=".tmp",
++            dir=target.document_directory,
++        )
++        try:
++            with os.fdopen(
++                temporary_file_descriptor, "w", encoding="utf8"
++            ) as temporary_file:
++                temporary_file.write(document_content)
++                temporary_file.flush()
++                os.fsync(temporary_file.fileno())
++            # The atomic rename is the commit point on disk: a rejected
++            # write, a full disk or a crash can only leave the temporary
++            # file, never a half-written target document.
++            os.replace(
++                temporary_file_path, target.document_full_path
++            )
++        except Exception:
++            self._remove_file_if_exists(temporary_file_path)
++            raise
++        self._source_file_created = True
++
++    def _create_missing_directories(
++        self, target: _DocumentTarget
++    ) -> List[str]:
++        missing_directories: List[str] = []
++        current_path = target.document_directory
++        while not os.path.isdir(current_path):
++            missing_directories.append(current_path)
++            current_path = os.path.dirname(current_path)
++
++        created_directories: List[str] = []
++        for directory in reversed(missing_directories):
++            os.mkdir(directory)
++            created_directories.append(directory)
++        return created_directories
++
++    def _commit_rebuilt_index(self) -> None:
++        traceability_index = TraceabilityIndexBuilder.create(
++            project_config=self.project_config,
++            parallelizer=self.parallelizer,
++        )
++        # Swap the index only after the rebuild fully succeeds. A failed
++        # rebuild therefore leaves the previous, consistent index in place.
++        self.export_action.traceability_index = traceability_index
++
++    def _rollback_created_paths(self, target: _DocumentTarget) -> None:
++        if self._source_file_created:
++            self._remove_file_if_exists(
++                target.document_full_path, inhibit_watcher=True
++            )
++            self._source_file_created = False
++        for directory in reversed(self._created_directories):
++            try:
++                os.rmdir(directory)
++            except OSError:
++                # Only the empty directories created by this commit are
++                # removed. Anything else is left untouched.
++                continue
++
++    def _recover_after_failed_export(self, target: _DocumentTarget) -> None:
++        derived_output_paths = self._collect_derived_output_paths(
++            self.export_action.traceability_index, target
++        )
++
++        # Undo the source-file part of the commit first, then rebuild the
++        # index from the restored disk so that the in-memory state matches
++        # the on-disk state again.
++        self._rollback_created_paths(target)
++
++        try:
++            restored_index = TraceabilityIndexBuilder.create(
++                project_config=self.project_config,
++                parallelizer=self.parallelizer,
++            )
++            self.export_action.traceability_index = restored_index
++        except Exception as recovery_error:  # noqa: BLE001
++            print(  # noqa: T201
++                "SERVER: failed to rebuild the project index while rolling "
++                f"back a document creation: {recovery_error}"
++            )
++            return
++
++        for output_path in derived_output_paths:
++            self._remove_file_if_exists(output_path)
++
++        try:
++            # Re-generate the shared pages (project tree, index) without the
++            # rolled-back document so the derived outputs match the disk.
++            self.export_action.export()
++        except Exception as recovery_error:  # noqa: BLE001
++            print(  # noqa: T201
++                "SERVER: failed to re-generate the HTML/PDF outputs while "
++                f"rolling back a document creation: {recovery_error}"
++            )
++
++    def _collect_derived_output_paths(
++        self, traceability_index: TraceabilityIndex, target: _DocumentTarget
++    ) -> List[str]:
++        for document in traceability_index.document_tree.document_list:
++            if document.meta is None:
++                continue
++            if (
++                document.meta.input_doc_full_path
++                != target.document_full_path
++            ):
++                continue
++            return [
++                document.meta.get_html_doc_path(),
++                document.meta.get_html_table_path(),
++                document.meta.get_html_traceability_path(),
++                document.meta.get_html_deep_traceability_path(),
++                document.meta.get_html_pdf_path(),
++            ]
++        return []
++
++    def _inhibit_watcher(self, path: str) -> None:
++        if self.document_watcher is not None:
++            self.document_watcher.inhibit_next_change(path)
++
++    def _remove_file_if_exists(
++        self, path: str, *, inhibit_watcher: bool = False
++    ) -> None:
++        if inhibit_watcher:
++            self._inhibit_watcher(path)
++        try:
++            if os.path.exists(path):
++                os.remove(path)
++        except OSError as error:
++            print(  # noqa: T201
++                f"SERVER: failed to remove '{path}' during rollback: {error}"
++            )
+diff --git a/strictdoc/server/routers/main_router.py b/strictdoc/server/routers/main_router.py
+index b3f2810..14ae348 100644
+--- a/strictdoc/server/routers/main_router.py
++++ b/strictdoc/server/routers/main_router.py
+@@ -168,6 +168,7 @@ from strictdoc.helpers.string import (
+     sanitize_html_form_field,
+ )
+ from strictdoc.helpers.timing import measure_performance
++from strictdoc.server.document_creation import DocumentCreationCommit
+ from strictdoc.server.document_watcher import (
+     DocumentWatcher,
+     get_watched_document_extensions,
+@@ -3235,6 +3236,31 @@ def create_main_router(
+                         "and underscore symbols."
+                     ),
+                 )
++            else:
++                assert isinstance(project_config.input_paths, list)
++                full_input_path = os.path.abspath(
++                    project_config.input_paths[0]
++                )
++                candidate_full_path = os.path.abspath(
++                    os.path.join(full_input_path, document_path)
++                )
++                try:
++                    path_is_within_input_folder = (
++                        os.path.commonpath(
++                            (full_input_path, candidate_full_path)
++                        )
++                        == full_input_path
++                    )
++                except ValueError:
++                    path_is_within_input_folder = False
++                if not path_is_within_input_folder:
++                    error_object.add_error(
++                        "document_path",
++                        (
++                            "Document path must be relative and stay "
++                            "within the input folder."
++                        ),
++                    )
+ 
+         if project_config.include_doc_paths is not None:
+             path_filter_includes = PathFilter(
+@@ -3298,56 +3324,48 @@ def create_main_router(
+                 },
+             )
+ 
+-        assert isinstance(project_config.input_paths, list)
+-        full_input_path = os.path.abspath(project_config.input_paths[0])
+-        file_tree_mount_folder = os.path.basename(
+-            os.path.dirname(full_input_path)
+-        )
+-        doc_full_path = os.path.join(full_input_path, document_path)
+-        doc_full_path_dir = os.path.dirname(doc_full_path)
+-        document_file_name = os.path.basename(doc_full_path)
+-        input_doc_dir_rel_path = os.path.dirname(document_path)
+-        input_doc_assets_dir_rel_path = (
+-            "/".join(
+-                (
+-                    file_tree_mount_folder,
+-                    input_doc_dir_rel_path,
+-                    "_assets",
+-                )
+-            )
+-            if len(input_doc_dir_rel_path) > 0
+-            else "/".join((file_tree_mount_folder, "_assets"))
++        # The source-file write, the TraceabilityIndex rebuild, the
++        # HTML/PDF export and the tree refresh are a single recoverable
++        # commit. Any failure rolls the created file, directories and index
++        # back and is reported back to the form instead of as a success.
++        document_creation_commit = DocumentCreationCommit(
++            project_config=project_config,
++            export_action=export_action,
++            parallelizer=parallelizer,
++            document_watcher=getattr(app.state, "document_watcher", None),
+         )
+-
+-        Path(doc_full_path_dir).mkdir(parents=True, exist_ok=True)
+-        document = SDocDocument(
+-            mid=None,
++        creation_outcome = document_creation_commit.perform(
+             title=document_title,
+-            config=None,
+-            view=None,
+-            grammar=DocumentGrammar.create_default(parent=None),
+-            section_contents=[],
+-        )
+-        # FIXME: Fill in the document meta correctly.
+-        document.meta = DocumentMeta(
+-            level=0,
+-            file_tree_mount_folder="NOT_RELEVANT",
+-            document_filename=document_file_name,
+-            document_filename_base="NOT_RELEVANT",
+-            input_doc_full_path=doc_full_path,
+-            input_doc_rel_path=SDocRelativePath(document_path),
+-            input_doc_dir_rel_path=SDocRelativePath(input_doc_dir_rel_path),
+-            input_doc_assets_dir_rel_path=SDocRelativePath(
+-                input_doc_assets_dir_rel_path
+-            ),
+-            output_document_dir_full_path="NOT_RELEVANT",
+-            output_document_dir_rel_path=SDocRelativePath("FIXME"),
++            relative_path=document_path,
+         )
+ 
+-        write_document_to_file(document)
+-
+-        export_action.build_index()
+-        export_action.export()
++        if not creation_outcome.success:
++            creation_failure = creation_outcome.failure
++            assert creation_failure is not None
++            error_object.add_error(
++                creation_failure.field, creation_failure.message
++            )
++            output = env().render_template_as_markup(
++                "actions/project_index/stream_new_document.jinja.html",
++                error_object=error_object,
++                document_title=document_title
++                if document_title is not None
++                else "",
++                document_path=document_path
++                if document_path is not None
++                else "",
++                include_doc_paths=project_config.include_doc_paths,
++                editable_document_extensions=(
++                    project_config.get_editable_document_extensions()
++                ),
++            )
++            return HTMLResponse(
++                content=output,
++                status_code=200,
++                headers={
++                    "Content-Type": "text/vnd.turbo-stream.html",
++                },
++            )
+ 
+         view_object = ProjectTreeViewObject(
+             traceability_index=export_action.traceability_index,
+diff --git a/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/expected_output/docs/existing.sdoc b/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/expected_output/docs/existing.sdoc
+new file mode 100644
+index 0000000..92a9c26
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/expected_output/docs/existing.sdoc
+@@ -0,0 +1,2 @@
++[DOCUMENT]
++TITLE: Existing Document
+diff --git a/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/input/docs/existing.sdoc b/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/input/docs/existing.sdoc
+new file mode 100644
+index 0000000..92a9c26
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/input/docs/existing.sdoc
+@@ -0,0 +1,2 @@
++[DOCUMENT]
++TITLE: Existing Document
+diff --git a/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/test_case.py b/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/test_case.py
+new file mode 100644
+index 0000000..8342298
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/_validation/create_document_validate_document_path_already_exists/test_case.py
+@@ -0,0 +1,42 @@
++"""
++@relation(SDOC-SRS-107, scope=function)
++"""
++
++from tests.end2end.e2e_case import E2ECase
++from tests.end2end.end2end_test_setup import End2EndTestSetup
++from tests.end2end.helpers.screens.project_index.form_add_document import (
++    Form_AddDocument,
++)
++from tests.end2end.helpers.screens.project_index.screen_project_index import (
++    Screen_ProjectIndex,
++)
++from tests.end2end.server import SDocTestServer
++
++
++class Test(E2ECase):
++    def test(self):
++        test_setup = End2EndTestSetup(path_to_test_file=__file__)
++
++        with SDocTestServer(
++            input_path=test_setup.path_to_sandbox
++        ) as test_server:
++            self.open(test_server.get_host_and_port())
++
++            screen_project_index = Screen_ProjectIndex(self)
++            screen_project_index.assert_on_screen()
++            screen_project_index.assert_contains_document("Existing Document")
++
++            form_add_document: Form_AddDocument = (
++                screen_project_index.do_open_modal_form_add_document()
++            )
++            form_add_document.do_fill_in_title("Different Title")
++            form_add_document.do_fill_in_path("docs/existing.sdoc")
++            form_add_document.do_form_submit_and_catch_error(
++                "A document already exists at this path. Choose another "
++                "path or remove the existing file first."
++            )
++
++            # The existing document is left untouched and still shown.
++            screen_project_index.assert_contains_document("Existing Document")
++
++        assert test_setup.compare_sandbox_and_expected_output()
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/docs/document1.sdoc b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/docs/document1.sdoc
+new file mode 100644
+index 0000000..111cdb1
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/docs/document1.sdoc
+@@ -0,0 +1,2 @@
++[DOCUMENT]
++TITLE: Document 1
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/dummy.txt b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/dummy.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/input/dummy.txt b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/input/dummy.txt
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/test_case.py b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/test_case.py
+new file mode 100644
+index 0000000..868d8ca
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/test_case.py
+@@ -0,0 +1,54 @@
++"""
++@relation(SDOC-SRS-107, scope=file)
++"""
++
++from selenium.webdriver.common.by import By
++
++from tests.end2end.e2e_case import E2ECase
++from tests.end2end.end2end_test_setup import End2EndTestSetup
++from tests.end2end.helpers.screens.project_index.form_add_document import (
++    Form_AddDocument,
++)
++from tests.end2end.helpers.screens.project_index.screen_project_index import (
++    Screen_ProjectIndex,
++)
++from tests.end2end.server import SDocTestServer
++
++
++class Test(E2ECase):
++    def test(self):
++        test_setup = End2EndTestSetup(path_to_test_file=__file__)
++
++        with SDocTestServer(
++            input_path=test_setup.path_to_sandbox
++        ) as test_server:
++            self.open(test_server.get_host_and_port())
++
++            screen_project_index = Screen_ProjectIndex(self)
++            screen_project_index.assert_on_screen()
++            screen_project_index.assert_empty_tree()
++
++            def submit_same_form() -> Form_AddDocument:
++                form_add_document = (
++                    screen_project_index.do_open_modal_form_add_document()
++                )
++                form_add_document.do_fill_in_title("Document 1")
++                form_add_document.do_fill_in_path("docs/document1.sdoc")
++                form_add_document.do_form_submit()
++                return form_add_document
++
++            # The same form is submitted twice, as happens with a duplicate
++            # browser request or a retry.
++            submit_same_form()
++            screen_project_index.assert_contains_document("Document 1")
++            submit_same_form()
++            screen_project_index.assert_contains_document("Document 1")
++
++            # Exactly one document, not a duplicate.
++            document_links = self.find_elements(
++                "//*[@data-testid='tree-file-link']",
++                by=By.XPATH,
++            )
++            assert len(document_links) == 1
++
++        assert test_setup.compare_sandbox_and_expected_output()
+diff --git a/tests/unit/strictdoc/server/test_document_creation.py b/tests/unit/strictdoc/server/test_document_creation.py
+new file mode 100644
+index 0000000..5b2d03d
+--- /dev/null
++++ b/tests/unit/strictdoc/server/test_document_creation.py
+@@ -0,0 +1,288 @@
++"""
++Unit tests for the recoverable Web UI document-creation commit.
++"""
++
++import os
++from pathlib import Path
++
++from strictdoc.backend.sdoc.errors.document_tree_error import (
++    DocumentTreeError,
++)
++from strictdoc.core.project_config import ProjectConfig
++from strictdoc.features.export.export_action import ExportAction
++from strictdoc.helpers.parallelizer import NullParallelizer
++from strictdoc.server import document_creation as document_creation_module
++from strictdoc.server.document_creation import DocumentCreationCommit
++
++
++def _create_project_config(
++    input_root: Path, output_root: Path
++) -> ProjectConfig:
++    project_config = ProjectConfig.default_config()
++    project_config.input_paths = [str(input_root)]
++    project_config.output_dir = str(output_root)
++    project_config.export_output_html_root = str(output_root / "html")
++    project_config.export_formats = ["html"]
++    return project_config
++
++
++def _create_commit(
++    tmp_path: Path,
++) -> tuple[DocumentCreationCommit, ExportAction, Path]:
++    input_root = tmp_path / "input"
++    input_root.mkdir(parents=True)
++    output_root = tmp_path / "output"
++    project_config = _create_project_config(input_root, output_root)
++    export_action = ExportAction(project_config, NullParallelizer())
++    commit = DocumentCreationCommit(
++        project_config=project_config,
++        export_action=export_action,
++        parallelizer=NullParallelizer(),
++        document_watcher=None,
++    )
++    return commit, export_action, input_root
++
++
++def _document_paths(export_action: ExportAction, document_full_path: str):
++    documents = [
++        document
++        for document in export_action.traceability_index.document_tree.document_list
++        if document.meta is not None
++        and document.meta.input_doc_full_path == document_full_path
++    ]
++    return documents
++
++
++def test_001_success_writes_file_and_refreshes_index(tmp_path):
++    commit, export_action, input_root = _create_commit(tmp_path)
++
++    outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.sdoc"
++    )
++
++    assert outcome.success
++    assert outcome.failure is None
++    assert not outcome.already_present
++
++    document_full_path = str(input_root / "docs" / "document1.sdoc")
++    assert os.path.isfile(document_full_path)
++    with open(document_full_path, encoding="utf8") as document_file:
++        assert document_file.read() == "[DOCUMENT]\nTITLE: Document 1\n"
++
++    documents = _document_paths(export_action, document_full_path)
++    assert len(documents) == 1
++    assert documents[0].title == "Document 1"
++
++    assert os.path.isfile(documents[0].meta.get_html_doc_path())
++
++
++def test_002_existing_file_with_other_content_is_rejected_untouched(tmp_path):
++    input_root = tmp_path / "input"
++    input_root.mkdir(parents=True)
++
++    existing_path = input_root / "docs" / "existing.sdoc"
++    existing_path.parent.mkdir(parents=True)
++    existing_path.write_text("[DOCUMENT]\nTITLE: Existing\n", encoding="utf8")
++
++    output_root = tmp_path / "output"
++    project_config = _create_project_config(input_root, output_root)
++    export_action = ExportAction(project_config, NullParallelizer())
++    commit = DocumentCreationCommit(
++        project_config=project_config,
++        export_action=export_action,
++        parallelizer=NullParallelizer(),
++        document_watcher=None,
++    )
++
++    outcome = commit.perform(
++        title="Brand New Title", relative_path="docs/existing.sdoc"
++    )
++
++    assert not outcome.success
++    assert outcome.failure is not None
++    assert outcome.failure.field == "document_path"
++    assert "already exists" in outcome.failure.message
++
++    assert existing_path.read_text(encoding="utf8") == (
++        "[DOCUMENT]\nTITLE: Existing\n"
++    )
++    assert len(_document_paths(export_action, str(existing_path))) == 1
++
++
++def test_003_same_form_resubmission_is_idempotent(tmp_path):
++    commit, export_action, input_root = _create_commit(tmp_path)
++
++    first_outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.sdoc"
++    )
++    second_outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.sdoc"
++    )
++
++    assert first_outcome.success
++    assert second_outcome.success
++    assert second_outcome.already_present
++
++    document_full_path = str(input_root / "docs" / "document1.sdoc")
++    documents = _document_paths(export_action, document_full_path)
++    assert len(documents) == 1
++    assert os.path.isfile(document_full_path)
++
++
++def test_004_write_failure_removes_file_directories_and_keeps_index(
++    tmp_path, monkeypatch
++):
++    commit, export_action, input_root = _create_commit(tmp_path)
++    previous_index = export_action.traceability_index
++
++    def failing_replace(_source, _destination):
++        raise OSError("simulated disk full")
++
++    monkeypatch.setattr(document_creation_module.os, "replace", failing_replace)
++
++    outcome = commit.perform(
++        title="Document 1", relative_path="nested/deep/document1.sdoc"
++    )
++
++    assert not outcome.success
++    assert outcome.failure is not None
++    assert "Could not write the document file" in outcome.failure.message
++
++    assert not (input_root / "nested").exists()
++    assert export_action.traceability_index is previous_index
++    assert (
++        len(export_action.traceability_index.document_tree.document_list) == 0
++    )
++
++
++def test_005_index_failure_rolls_back_and_same_form_retries(
++    tmp_path, monkeypatch
++):
++    commit, export_action, input_root = _create_commit(tmp_path)
++    previous_index = export_action.traceability_index
++    document_full_path = str(input_root / "docs" / "document1.sdoc")
++
++    def failing_create(**_kwargs):
++        raise DocumentTreeError.cycle_error("DUP-1", ["DUP-1"])
++
++    monkeypatch.setattr(
++        document_creation_module.TraceabilityIndexBuilder,
++        "create",
++        failing_create,
++    )
++
++    outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.sdoc"
++    )
++
++    assert not outcome.success
++    assert outcome.failure is not None
++    assert "Failed to rebuild the project index" in outcome.failure.message
++
++    assert not os.path.exists(document_full_path)
++    assert not (input_root / "docs").exists()
++    assert export_action.traceability_index is previous_index
++
++    monkeypatch.undo()
++
++    retry_outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.sdoc"
++    )
++
++    assert retry_outcome.success
++    assert os.path.isfile(document_full_path)
++    assert len(_document_paths(export_action, document_full_path)) == 1
++
++
++def test_006_export_failure_rolls_back_source_outputs_and_index(
++    tmp_path, monkeypatch
++):
++    commit, export_action, input_root = _create_commit(tmp_path)
++    previous_index = export_action.traceability_index
++    document_full_path = str(input_root / "docs" / "document1.sdoc")
++
++    original_export = export_action.export
++    export_calls = {"count": 0}
++    stale_output_paths = []
++
++    def failing_export_first_time():
++        export_calls["count"] += 1
++        if export_calls["count"] == 1:
++            # Simulate a derived output left behind by a failed export.
++            documents = _document_paths(export_action, document_full_path)
++            assert len(documents) == 1
++            html_doc_path = documents[0].meta.get_html_doc_path()
++            Path(html_doc_path).parent.mkdir(parents=True, exist_ok=True)
++            with open(html_doc_path, "w", encoding="utf8") as html_file:
++                html_file.write("<html>stale</html>")
++            stale_output_paths.append(html_doc_path)
++            raise RuntimeError("simulated HTML export failure")
++        return original_export()
++
++    monkeypatch.setattr(export_action, "export", failing_export_first_time)
++
++    outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.sdoc"
++    )
++
++    assert not outcome.success
++    assert outcome.failure is not None
++    assert "Failed to generate the HTML/PDF outputs" in (
++        outcome.failure.message
++    )
++
++    # The source file is rolled back and the restored index no longer
++    # contains the document.
++    assert not os.path.exists(document_full_path)
++    assert len(_document_paths(export_action, document_full_path)) == 0
++    assert export_action.traceability_index is not previous_index
++    assert (
++        len(export_action.traceability_index.document_tree.document_list) == 0
++    )
++
++    # The stale derived output is removed and the recovery re-export runs.
++    assert len(stale_output_paths) == 1
++    assert not os.path.exists(stale_output_paths[0])
++    assert export_calls["count"] == 2
++
++    # After the cause is fixed, the same form retries deterministically.
++    monkeypatch.undo()
++    retry_outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.sdoc"
++    )
++    assert retry_outcome.success
++    assert os.path.isfile(document_full_path)
++    assert len(_document_paths(export_action, document_full_path)) == 1
++
++
++def test_007_markdown_extension_writes_markdown_document(tmp_path):
++    commit, export_action, input_root = _create_commit(tmp_path)
++
++    outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.md"
++    )
++
++    assert outcome.success
++    document_full_path = str(input_root / "docs" / "document1.md")
++    with open(document_full_path, encoding="utf8") as document_file:
++        assert document_file.read() == "# Document 1\n"
++    assert len(_document_paths(export_action, document_full_path)) == 1
++
++
++def test_008_path_component_that_is_a_file_is_rejected(tmp_path):
++    commit, export_action, input_root = _create_commit(tmp_path)
++
++    blocking_file = input_root / "docs"
++    blocking_file.write_text("I am a file", encoding="utf8")
++
++    outcome = commit.perform(
++        title="Document 1", relative_path="docs/document1.sdoc"
++    )
++
++    assert not outcome.success
++    assert outcome.failure is not None
++    assert "is not a directory" in outcome.failure.message
++    assert blocking_file.read_text(encoding="utf8") == "I am a file"
++    assert (
++        len(export_action.traceability_index.document_tree.document_list) == 0
++    )
