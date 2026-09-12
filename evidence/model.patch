@@ -1,0 +1,1542 @@
+diff --git a/docs/strictdoc_04_release_notes.sdoc b/docs/strictdoc_04_release_notes.sdoc
+index 44d2c0dd0..f7f129100 100644
+--- a/docs/strictdoc_04_release_notes.sdoc
++++ b/docs/strictdoc_04_release_notes.sdoc
+@@ -49,6 +49,25 @@ releases:
+ `StrictDoc Releases <https://github.com/strictdoc-project/strictdoc/releases>`_.
+ <<<
+ 
++[[SECTION]]
++MID: 7a8b9c0d1e2f30415263748596a7b8c9
++TITLE: Unreleased
++
++[TEXT]
++MID: 8b9c0d1e2f30415263748596a7b8c9d0
++STATEMENT: >>>
++This release contains the following enhancements:
++
++1\) Fixed: creating a document in the Web UI is now a recoverable
++operation. If the index rebuild or the HTML/PDF export fails after the
++source file is written, StrictDoc reports the error, rolls the partial
++creation back, and keeps the index consistent with disk. Submitting the
++same form again finishes the same document without a duplicate, and
++existing documents are never overwritten.
++<<<
++
++[[/SECTION]]
++
+ [[SECTION]]
+ MID: 5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e
+ TITLE: 0.29.0 (2026-08-30)
+diff --git a/strictdoc/server/document_creation.py b/strictdoc/server/document_creation.py
+new file mode 100644
+index 000000000..f60f69448
+--- /dev/null
++++ b/strictdoc/server/document_creation.py
+@@ -0,0 +1,561 @@
++"""
++Recoverable create-document flow for the StrictDoc Web UI.
++
++The flow is staged around a single commit state:
++
++1. Validate the target path and serialize the new document in memory.
++2. Land the source file atomically (temporary file plus os.replace).
++3. Rebuild the TraceabilityIndex (and its GraphDatabase) and regenerate
++   the derived outputs.
++
++A failure at any stage is either rolled back or left in a recoverable
++state. The browser is only informed about success after every stage
++succeeds. Repeating the same submission adopts the document left behind
++by a previous attempt instead of creating a duplicate.
++"""
++
++import os
++import sys
++import tempfile
++from dataclasses import dataclass
++from pathlib import Path
++from typing import List, Optional, Protocol
++
++from strictdoc.backend.markdown.reader import SDMarkdownReader
++from strictdoc.backend.markdown.writer import SDMarkdownWriter
++from strictdoc.backend.sdoc.models.document import SDocDocument
++from strictdoc.backend.sdoc.models.document_grammar import (
++    DocumentGrammar,
++)
++from strictdoc.backend.sdoc.reader import SDReader
++from strictdoc.backend.sdoc.writer import SDWriter
++from strictdoc.core.document_meta import DocumentMeta
++from strictdoc.core.project_config import ProjectConfig
++from strictdoc.core.traceability_index import TraceabilityIndex
++from strictdoc.helpers.file_system import file_open_read_utf8
++from strictdoc.helpers.paths import SDocRelativePath
++
++# The file mode mirrors the default mode of open(..., "w"), which is
++# 0o666 modified by the process umask (0o644 for the usual 0o022).
++# tempfile.mkstemp creates files with 0o600, which is stricter than the
++# mode the previous create-document flow used to produce.
++_DEFAULT_DOCUMENT_FILE_MODE = 0o644
++
++
++class CreateDocumentFailure(Exception):
++    """
++    Raised when a document cannot be created.
++
++    The field name matches the Web UI form field that the failure is
++    reported against.
++    """
++
++    def __init__(self, field_name: str, message: str) -> None:
++        super().__init__(message)
++        self.field_name = field_name
++        self.message = message
++
++
++class DocumentCommitTarget(Protocol):
++    """
++    The subset of ExportAction that the transaction commits against.
++    """
++
++    traceability_index: TraceabilityIndex
++
++    def build_index(self) -> TraceabilityIndex: ...
++
++    def export(self) -> None: ...
++
++
++class DocumentChangeInhibitor(Protocol):
++    """
++    The subset of DocumentWatcher that suppresses watcher-triggered
++    rebuilds for files the server writes itself.
++    """
++
++    def inhibit_next_change(self, path: str) -> None: ...
++
++
++@dataclass
++class CreatedDocument:
++    document_full_path: str
++    recovered: bool
++
++
++@dataclass
++class _DocumentPaths:
++    input_root_full_path: str
++    document_full_path: str
++    document_full_path_dir: str
++    document_file_name: str
++    document_dir_rel_path: str
++    file_tree_mount_folder: str
++    assets_dir_rel_path: str
++
++
++@dataclass
++class _PreparedSource:
++    recovered: bool
++    created_directories: List[str]
++
++
++class CreateDocumentTransaction:
++    def __init__(
++        self,
++        *,
++        project_config: ProjectConfig,
++        export_action: DocumentCommitTarget,
++        sdoc_writer: SDWriter,
++        document_watcher: Optional[DocumentChangeInhibitor] = None,
++    ) -> None:
++        self.project_config: ProjectConfig = project_config
++        self.export_action: DocumentCommitTarget = export_action
++        self.sdoc_writer: SDWriter = sdoc_writer
++        self.document_watcher: Optional[DocumentChangeInhibitor] = (
++            document_watcher
++        )
++
++    def create(
++        self, *, document_title: str, document_path: str
++    ) -> CreatedDocument:
++        """
++        Run the staged create-document flow.
++
++        Raises CreateDocumentFailure when any stage fails. No exception
++        means that the source file, the index and the derived outputs are
++        consistent with each other.
++        """
++
++        document_paths = self._resolve_document_paths(document_path)
++        prepared_source = self._prepare_source_file(
++            document_title=document_title,
++            document_path=document_path,
++            document_paths=document_paths,
++        )
++        self._commit(
++            document_paths=document_paths,
++            prepared_source=prepared_source,
++        )
++        return CreatedDocument(
++            document_full_path=document_paths.document_full_path,
++            recovered=prepared_source.recovered,
++        )
++
++    def _resolve_document_paths(self, document_path: str) -> _DocumentPaths:
++        assert isinstance(self.project_config.input_paths, list)
++        input_root_full_path = os.path.abspath(
++            self.project_config.input_paths[0]
++        )
++        document_full_path = os.path.join(input_root_full_path, document_path)
++        document_full_path = os.path.abspath(document_full_path)
++
++        # The form validation already rejects ".." components. This check
++        # keeps the transaction safe when it is reused outside of the Web
++        # UI form.
++        if not self._is_path_within(document_full_path, input_root_full_path):
++            raise CreateDocumentFailure(
++                "document_path",
++                "Document path must remain within the project input path.",
++            )
++
++        document_full_path_dir = os.path.dirname(document_full_path)
++        document_file_name = os.path.basename(document_full_path)
++        document_dir_rel_path = os.path.dirname(document_path)
++        file_tree_mount_folder = os.path.basename(
++            os.path.dirname(input_root_full_path)
++        )
++        if len(document_dir_rel_path) > 0:
++            assets_dir_rel_path = "/".join(
++                (
++                    file_tree_mount_folder,
++                    document_dir_rel_path,
++                    "_assets",
++                )
++            )
++        else:
++            assets_dir_rel_path = "/".join((file_tree_mount_folder, "_assets"))
++
++        return _DocumentPaths(
++            input_root_full_path=input_root_full_path,
++            document_full_path=document_full_path,
++            document_full_path_dir=document_full_path_dir,
++            document_file_name=document_file_name,
++            document_dir_rel_path=document_dir_rel_path,
++            file_tree_mount_folder=file_tree_mount_folder,
++            assets_dir_rel_path=assets_dir_rel_path,
++        )
++
++    def _prepare_source_file(
++        self,
++        *,
++        document_title: str,
++        document_path: str,
++        document_paths: _DocumentPaths,
++    ) -> _PreparedSource:
++        existing_document = self._read_existing_document(
++            document_title=document_title,
++            document_paths=document_paths,
++        )
++        if existing_document is not None:
++            # The same form was submitted again, or a previous attempt
++            # landed the source file but failed while committing. Adopt
++            # the file instead of overwriting it or creating a duplicate.
++            return _PreparedSource(
++                recovered=True,
++                created_directories=[],
++            )
++
++        if os.path.exists(document_paths.document_full_path):
++            raise CreateDocumentFailure(
++                "document_path",
++                "A document already exists at this path. Choose a "
++                "different path or open the existing document.",
++            )
++
++        created_directories = self._plan_missing_directories(document_paths)
++        document = self._build_document(
++            document_title=document_title,
++            document_path=document_path,
++            document_paths=document_paths,
++        )
++        document_content = self._serialize_document(
++            document_paths=document_paths,
++            document=document,
++        )
++        self._land_source_file(
++            document_paths=document_paths,
++            document_content=document_content,
++            created_directories=created_directories,
++        )
++        return _PreparedSource(
++            recovered=False,
++            created_directories=created_directories,
++        )
++
++    def _commit(
++        self,
++        *,
++        document_paths: _DocumentPaths,
++        prepared_source: _PreparedSource,
++    ) -> None:
++        previous_index = self.export_action.traceability_index
++        new_index: Optional[TraceabilityIndex] = None
++        try:
++            self.export_action.build_index()
++            new_index = self.export_action.traceability_index
++            self.export_action.export()
++        except (Exception, SystemExit) as commit_error:
++            self._rollback_after_commit_failure(
++                document_paths=document_paths,
++                prepared_source=prepared_source,
++                previous_index=previous_index,
++                new_index=new_index,
++                commit_error=commit_error,
++            )
++
++    def _build_document(
++        self,
++        *,
++        document_title: str,
++        document_path: str,
++        document_paths: _DocumentPaths,
++    ) -> SDocDocument:
++        document = SDocDocument(
++            mid=None,
++            title=document_title,
++            config=None,
++            view=None,
++            grammar=DocumentGrammar.create_default(parent=None),
++            section_contents=[],
++        )
++        # FIXME: Fill in the document meta correctly.
++        document.meta = DocumentMeta(
++            level=0,
++            file_tree_mount_folder="NOT_RELEVANT",
++            document_filename=document_paths.document_file_name,
++            document_filename_base="NOT_RELEVANT",
++            input_doc_full_path=document_paths.document_full_path,
++            input_doc_rel_path=SDocRelativePath(document_path),
++            input_doc_dir_rel_path=SDocRelativePath(
++                document_paths.document_dir_rel_path
++            ),
++            input_doc_assets_dir_rel_path=SDocRelativePath(
++                document_paths.assets_dir_rel_path
++            ),
++            output_document_dir_full_path="NOT_RELEVANT",
++            output_document_dir_rel_path=SDocRelativePath("FIXME"),
++        )
++        return document
++
++    def _serialize_document(
++        self,
++        *,
++        document_paths: _DocumentPaths,
++        document: SDocDocument,
++    ) -> str:
++        if self._is_markdown_path(document_paths.document_full_path):
++            return SDMarkdownWriter.write(
++                document,
++                line_width=self.project_config.document_line_width,
++            )
++        return self.sdoc_writer.write(document)
++
++    def _read_existing_document(
++        self,
++        *,
++        document_title: str,
++        document_paths: _DocumentPaths,
++    ) -> Optional[SDocDocument]:
++        """
++        Recognize the target file as a document that a previous identical
++        submission started creating. Everything else (a document with
++        content, a different title, an unparseable file) is treated as an
++        unrelated existing file that must not be touched.
++        """
++
++        if not os.path.isfile(document_paths.document_full_path):
++            return None
++        try:
++            with file_open_read_utf8(
++                document_paths.document_full_path
++            ) as document_file:
++                document_content = document_file.read()
++            if self._is_markdown_path(document_paths.document_full_path):
++                existing_document = SDMarkdownReader.read(
++                    document_content,
++                    document_paths.document_full_path,
++                    self.project_config,
++                )
++            else:
++                existing_document = SDReader.read(
++                    document_content,
++                    file_path=document_paths.document_full_path,
++                )
++        except Exception:  # noqa: BLE001
++            return None
++        if existing_document.title != document_title:
++            return None
++        if existing_document.has_any_nodes():
++            return None
++        return existing_document
++
++    def _land_source_file(
++        self,
++        *,
++        document_paths: _DocumentPaths,
++        document_content: str,
++        created_directories: List[str],
++    ) -> None:
++        temporary_path: Optional[str] = None
++        try:
++            Path(document_paths.document_full_path_dir).mkdir(
++                parents=True,
++                exist_ok=True,
++            )
++            file_descriptor, temporary_path = tempfile.mkstemp(
++                prefix=f".{document_paths.document_file_name}.",
++                suffix=".tmp",
++                dir=document_paths.document_full_path_dir,
++            )
++            with os.fdopen(
++                file_descriptor,
++                "w",
++                encoding="utf8",
++            ) as output_file:
++                output_file.write(document_content)
++                output_file.flush()
++                os.fsync(output_file.fileno())
++            os.chmod(
++                temporary_path,
++                _DEFAULT_DOCUMENT_FILE_MODE,
++            )
++            self._inhibit_next_change(document_paths.document_full_path)
++            os.replace(
++                temporary_path,
++                document_paths.document_full_path,
++            )
++            temporary_path = None
++            self._synchronize_directory(document_paths.document_full_path_dir)
++        except OSError as os_error:
++            if temporary_path is not None:
++                self._remove_file_if_exists(temporary_path)
++            self._remove_empty_directories(created_directories)
++            raise CreateDocumentFailure(
++                "document_path",
++                "The document file could not be created at this path: "
++                f"{os_error}. Fix the file permissions or free disk "
++                "space and retry.",
++            ) from os_error
++
++    def _rollback_after_commit_failure(
++        self,
++        *,
++        document_paths: _DocumentPaths,
++        prepared_source: _PreparedSource,
++        previous_index: TraceabilityIndex,
++        new_index: Optional[TraceabilityIndex],
++        commit_error: BaseException,
++    ) -> None:
++        # Restore the index, including its GraphDatabase, to the state it
++        # had before the commit so in-memory data never points to a
++        # half-committed tree.
++        self.export_action.traceability_index = previous_index
++
++        if new_index is None:
++            # The index build failed. The landed source file is not part
++            # of any consistent tree, so remove the files created by this
++            # attempt. Derived outputs were never generated.
++            if not prepared_source.recovered:
++                self._inhibit_next_change(document_paths.document_full_path)
++                self._remove_file_if_exists(document_paths.document_full_path)
++                self._remove_empty_directories(
++                    prepared_source.created_directories
++                )
++            raise CreateDocumentFailure(
++                "document_path",
++                "The document could not be added to the project index: "
++                f"{commit_error}. No partial document was kept. Fix the "
++                "cause and retry.",
++            ) from commit_error
++
++        # The index build succeeded but exporting derived outputs failed.
++        # The source file is a valid document, so keep it: a retry adopts
++        # it deterministically and resumes at the export stage. Remove the
++        # derived outputs that this attempt produced, then regenerate the
++        # shared screens from the restored index.
++        new_document_meta = self._find_document_meta(
++            traceability_index=new_index,
++            document_full_path=document_paths.document_full_path,
++        )
++        if new_document_meta is not None:
++            self._remove_derived_outputs(new_document_meta)
++        previous_index.update_last_updated()
++        self._regenerate_derived_outputs_after_rollback()
++        raise CreateDocumentFailure(
++            "document_path",
++            "The document was created but its derived outputs could not "
++            f"be generated: {commit_error}. The source document was "
++            "kept. Fix the cause and submit the same form again to "
++            "finish the creation.",
++        ) from commit_error
++
++    def _regenerate_derived_outputs_after_rollback(self) -> None:
++        try:
++            self.export_action.export()
++        except (Exception, SystemExit) as recovery_error:
++            # The failure is already reported to the browser. On-demand
++            # screen generation and the bumped index timestamp converge
++            # the derived outputs to the restored index later.
++            print(  # noqa: T201
++                "CREATE: could not regenerate derived outputs after "
++                f"rolling back a failed creation: {recovery_error}"
++            )
++
++    def _find_document_meta(
++        self,
++        *,
++        traceability_index: TraceabilityIndex,
++        document_full_path: str,
++    ) -> Optional[DocumentMeta]:
++        for document in traceability_index.document_tree.document_list:
++            if document.meta is None:
++                continue
++            if document.meta.input_doc_full_path == document_full_path:
++                return document.meta
++        return None
++
++    def _remove_derived_outputs(self, document_meta: DocumentMeta) -> None:
++        derived_paths = [
++            document_meta.get_html_doc_path(),
++            document_meta.get_html_table_path(),
++            document_meta.get_html_traceability_path(),
++            document_meta.get_html_deep_traceability_path(),
++            document_meta.get_html_pdf_path(),
++        ]
++        for derived_path in derived_paths:
++            self._remove_file_if_exists(derived_path)
++        try:
++            os.rmdir(document_meta.output_document_dir_full_path)
++        except OSError:
++            # The directory does not exist or still contains other
++            # files. It is safe to leave it in both cases.
++            pass
++
++    def _plan_missing_directories(
++        self, document_paths: _DocumentPaths
++    ) -> List[str]:
++        """
++        Collect the leaf-to-root chain of directories that do not exist
++        yet, so a rollback removes only directories created by this
++        attempt.
++        """
++
++        missing_directories: List[str] = []
++        current_path = document_paths.document_full_path_dir
++        root_path = document_paths.input_root_full_path
++        while (
++            len(current_path) >= len(root_path)
++            and current_path != root_path
++            and not os.path.exists(current_path)
++        ):
++            missing_directories.append(current_path)
++            parent_path = os.path.dirname(current_path)
++            if parent_path == current_path:
++                break
++            current_path = parent_path
++        return missing_directories
++
++    def _remove_empty_directories(self, created_directories: List[str]) -> None:
++        for directory_path in created_directories:
++            try:
++                os.rmdir(directory_path)
++            except OSError:
++                # The directory does not exist or is not empty. Prefer
++                # leaving it over deleting user content.
++                pass
++
++    def _inhibit_next_change(self, path: str) -> None:
++        if self.document_watcher is not None:
++            self.document_watcher.inhibit_next_change(path)
++
++    @staticmethod
++    def _remove_file_if_exists(file_path: str) -> None:
++        try:
++            os.remove(file_path)
++        except FileNotFoundError:
++            pass
++        except OSError:
++            # The remaining file can be removed manually. Keeping it is
++            # safer than hiding a persistent permission problem.
++            pass
++
++    @staticmethod
++    def _synchronize_directory(directory_path: str) -> None:
++        if sys.platform == "win32":
++            return
++        try:
++            directory_descriptor = os.open(
++                directory_path,
++                os.O_RDONLY,
++            )
++            try:
++                os.fsync(directory_descriptor)
++            finally:
++                os.close(directory_descriptor)
++        except OSError:
++            # Directory fsync is a durability hint, not a requirement
++            # for process-level consistency.
++            pass
++
++    @staticmethod
++    def _is_path_within(child_path: str, parent_path: str) -> bool:
++        try:
++            common_path = os.path.commonpath([child_path, parent_path])
++        except ValueError:
++            return False
++        return common_path == parent_path
++
++    @staticmethod
++    def _is_markdown_path(document_full_path: str) -> bool:
++        return document_full_path.lower().endswith((".md", ".markdown"))
+diff --git a/strictdoc/server/routers/main_router.py b/strictdoc/server/routers/main_router.py
+index b3f28106e..3308ea10f 100644
+--- a/strictdoc/server/routers/main_router.py
++++ b/strictdoc/server/routers/main_router.py
+@@ -168,6 +168,10 @@ from strictdoc.helpers.string import (
+     sanitize_html_form_field,
+ )
+ from strictdoc.helpers.timing import measure_performance
++from strictdoc.server.document_creation import (
++    CreateDocumentFailure,
++    CreateDocumentTransaction,
++)
+ from strictdoc.server.document_watcher import (
+     DocumentWatcher,
+     get_watched_document_extensions,
+@@ -3298,56 +3302,46 @@ def create_main_router(
+                 },
+             )
+ 
+-        assert isinstance(project_config.input_paths, list)
+-        full_input_path = os.path.abspath(project_config.input_paths[0])
+-        file_tree_mount_folder = os.path.basename(
+-            os.path.dirname(full_input_path)
+-        )
+-        doc_full_path = os.path.join(full_input_path, document_path)
+-        doc_full_path_dir = os.path.dirname(doc_full_path)
+-        document_file_name = os.path.basename(doc_full_path)
+-        input_doc_dir_rel_path = os.path.dirname(document_path)
+-        input_doc_assets_dir_rel_path = (
+-            "/".join(
+-                (
+-                    file_tree_mount_folder,
+-                    input_doc_dir_rel_path,
+-                    "_assets",
+-                )
+-            )
+-            if len(input_doc_dir_rel_path) > 0
+-            else "/".join((file_tree_mount_folder, "_assets"))
+-        )
+-
+-        Path(doc_full_path_dir).mkdir(parents=True, exist_ok=True)
+-        document = SDocDocument(
+-            mid=None,
+-            title=document_title,
+-            config=None,
+-            view=None,
+-            grammar=DocumentGrammar.create_default(parent=None),
+-            section_contents=[],
+-        )
+-        # FIXME: Fill in the document meta correctly.
+-        document.meta = DocumentMeta(
+-            level=0,
+-            file_tree_mount_folder="NOT_RELEVANT",
+-            document_filename=document_file_name,
+-            document_filename_base="NOT_RELEVANT",
+-            input_doc_full_path=doc_full_path,
+-            input_doc_rel_path=SDocRelativePath(document_path),
+-            input_doc_dir_rel_path=SDocRelativePath(input_doc_dir_rel_path),
+-            input_doc_assets_dir_rel_path=SDocRelativePath(
+-                input_doc_assets_dir_rel_path
+-            ),
+-            output_document_dir_full_path="NOT_RELEVANT",
+-            output_document_dir_rel_path=SDocRelativePath("FIXME"),
++        # The transaction makes the source file landing, the index
++        # rebuild and the derived-output export one recoverable commit:
++        # a failure at any stage is rolled back or left in a state that a
++        # repeated submission of this form resumes deterministically.
++        document_watcher = getattr(app.state, "document_watcher", None)
++        create_document_transaction = CreateDocumentTransaction(
++            project_config=project_config,
++            export_action=export_action,
++            sdoc_writer=sdoc_writer,
++            document_watcher=document_watcher,
+         )
+-
+-        write_document_to_file(document)
+-
+-        export_action.build_index()
+-        export_action.export()
++        try:
++            create_document_transaction.create(
++                document_title=document_title,
++                document_path=document_path,
++            )
++        except CreateDocumentFailure as create_document_failure:
++            error_object.add_error(
++                create_document_failure.field_name,
++                create_document_failure.message,
++            )
++            output = env().render_template_as_markup(
++                "actions/project_index/stream_new_document.jinja.html",
++                error_object=error_object,
++                document_title=document_title
++                if document_title is not None
++                else "",
++                document_path=document_path
++                if document_path is not None
++                else "",
++                include_doc_paths=project_config.include_doc_paths,
++                editable_document_extensions=editable_document_extensions,
++            )
++            return HTMLResponse(
++                content=output,
++                status_code=200,
++                headers={
++                    "Content-Type": "text/vnd.turbo-stream.html",
++                },
++            )
+ 
+         view_object = ProjectTreeViewObject(
+             traceability_index=export_action.traceability_index,
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/expected_output/docs/document1.sdoc b/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/expected_output/docs/document1.sdoc
+new file mode 100644
+index 000000000..111cdb118
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/expected_output/docs/document1.sdoc
+@@ -0,0 +1,2 @@
++[DOCUMENT]
++TITLE: Document 1
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/input/docs/document1.sdoc b/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/input/docs/document1.sdoc
+new file mode 100644
+index 000000000..111cdb118
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/input/docs/document1.sdoc
+@@ -0,0 +1,2 @@
++[DOCUMENT]
++TITLE: Document 1
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/test_case.py b/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/test_case.py
+new file mode 100644
+index 000000000..ff5b2531a
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_adopts_leftover_stub/test_case.py
+@@ -0,0 +1,49 @@
++"""
++@relation(SDOC-SRS-107, scope=file)
++"""
++
++from selenium.webdriver.common.by import By
++
++from tests.end2end.e2e_case import E2ECase
++from tests.end2end.end2end_test_setup import End2EndTestSetup
++from tests.end2end.helpers.screens.project_index.form_add_document import (
++    Form_AddDocument,
++)
++from tests.end2end.helpers.screens.project_index.screen_project_index import (
++    Screen_ProjectIndex,
++)
++from tests.end2end.server import SDocTestServer
++
++
++class Test(E2ECase):
++    def test(self):
++        test_setup = End2EndTestSetup(path_to_test_file=__file__)
++
++        with SDocTestServer(
++            input_path=test_setup.path_to_sandbox
++        ) as test_server:
++            self.open(test_server.get_host_and_port())
++
++            screen_project_index = Screen_ProjectIndex(self)
++            screen_project_index.assert_on_screen()
++            screen_project_index.assert_contains_document("Document 1")
++
++            # The sandbox already contains the empty source file that a
++            # previous, interrupted attempt left behind. Repeating the
++            # same form must resume that creation deterministically
++            # instead of overwriting the file or adding a duplicate.
++            form_add_document: Form_AddDocument = (
++                screen_project_index.do_open_modal_form_add_document()
++            )
++            form_add_document.do_fill_in_title("Document 1")
++            form_add_document.do_fill_in_path("docs/document1.sdoc")
++            form_add_document.do_form_submit()
++
++            screen_project_index.assert_contains_document("Document 1")
++            tree_file_links = self.find_elements(
++                "//*[@data-testid='tree-file-link']",
++                by=By.XPATH,
++            )
++            assert len(tree_file_links) == 1
++
++        assert test_setup.compare_sandbox_and_expected_output()
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/expected_output/docs/existing.sdoc b/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/expected_output/docs/existing.sdoc
+new file mode 100644
+index 000000000..2f0fd266b
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/expected_output/docs/existing.sdoc
+@@ -0,0 +1,9 @@
++[DOCUMENT]
++TITLE: Existing document
++
++[REQUIREMENT]
++UID: REQ-EXISTING-001
++TITLE: Existing requirement
++STATEMENT: >>>
++This requirement already exists and must not be lost.
++<<<
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/input/docs/existing.sdoc b/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/input/docs/existing.sdoc
+new file mode 100644
+index 000000000..2f0fd266b
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/input/docs/existing.sdoc
+@@ -0,0 +1,9 @@
++[DOCUMENT]
++TITLE: Existing document
++
++[REQUIREMENT]
++UID: REQ-EXISTING-001
++TITLE: Existing requirement
++STATEMENT: >>>
++This requirement already exists and must not be lost.
++<<<
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/test_case.py b/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/test_case.py
+new file mode 100644
+index 000000000..393101af4
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_existing_document_conflict/test_case.py
+@@ -0,0 +1,44 @@
++"""
++@relation(SDOC-SRS-107, scope=file)
++"""
++
++from tests.end2end.e2e_case import E2ECase
++from tests.end2end.end2end_test_setup import End2EndTestSetup
++from tests.end2end.helpers.screens.project_index.form_add_document import (
++    Form_AddDocument,
++)
++from tests.end2end.helpers.screens.project_index.screen_project_index import (
++    Screen_ProjectIndex,
++)
++from tests.end2end.server import SDocTestServer
++
++
++class Test(E2ECase):
++    def test(self):
++        test_setup = End2EndTestSetup(path_to_test_file=__file__)
++
++        with SDocTestServer(
++            input_path=test_setup.path_to_sandbox
++        ) as test_server:
++            self.open(test_server.get_host_and_port())
++
++            screen_project_index = Screen_ProjectIndex(self)
++            screen_project_index.assert_on_screen()
++            screen_project_index.assert_contains_document(
++                "Existing document"
++            )
++
++            # The target path already belongs to a document that has
++            # content. The create flow must reject the form and leave
++            # the existing document untouched.
++            form_add_document: Form_AddDocument = (
++                screen_project_index.do_open_modal_form_add_document()
++            )
++            form_add_document.do_fill_in_title("Existing document")
++            form_add_document.do_fill_in_path("docs/existing.sdoc")
++            form_add_document.do_form_submit_and_catch_error(
++                "A document already exists at this path. Choose a "
++                "different path or open the existing document."
++            )
++
++        assert test_setup.compare_sandbox_and_expected_output()
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/docs/document1.sdoc b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/docs/document1.sdoc
+new file mode 100644
+index 000000000..111cdb118
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/docs/document1.sdoc
+@@ -0,0 +1,2 @@
++[DOCUMENT]
++TITLE: Document 1
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/dummy.txt b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/expected_output/dummy.txt
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/input/dummy.txt b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/input/dummy.txt
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/test_case.py b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/test_case.py
+new file mode 100644
+index 000000000..3bbbb1c71
+--- /dev/null
++++ b/tests/end2end/screens/project_index/create_document/create_document_idempotent_resubmit/test_case.py
+@@ -0,0 +1,55 @@
++"""
++@relation(SDOC-SRS-107, scope=file)
++"""
++
++from selenium.webdriver.common.by import By
++
++from tests.end2end.e2e_case import E2ECase
++from tests.end2end.end2end_test_setup import End2EndTestSetup
++from tests.end2end.helpers.screens.project_index.form_add_document import (
++    Form_AddDocument,
++)
++from tests.end2end.helpers.screens.project_index.screen_project_index import (
++    Screen_ProjectIndex,
++)
++from tests.end2end.server import SDocTestServer
++
++
++class Test(E2ECase):
++    def test(self):
++        test_setup = End2EndTestSetup(path_to_test_file=__file__)
++
++        with SDocTestServer(
++            input_path=test_setup.path_to_sandbox
++        ) as test_server:
++            self.open(test_server.get_host_and_port())
++
++            screen_project_index = Screen_ProjectIndex(self)
++            screen_project_index.assert_on_screen()
++            screen_project_index.assert_empty_tree()
++
++            def submit_same_form() -> Form_AddDocument:
++                form_add_document = (
++                    screen_project_index.do_open_modal_form_add_document()
++                )
++                form_add_document.do_fill_in_title("Document 1")
++                form_add_document.do_fill_in_path("docs/document1.sdoc")
++                form_add_document.do_form_submit()
++                return form_add_document
++
++            submit_same_form()
++            screen_project_index.assert_contains_document("Document 1")
++
++            # Submitting the same form again must be idempotent: the
++            # second submission adopts the now-existing document instead
++            # of creating a duplicate or overwriting it.
++            submit_same_form()
++            screen_project_index.assert_contains_document("Document 1")
++
++            tree_file_links = self.find_elements(
++                "//*[@data-testid='tree-file-link']",
++                by=By.XPATH,
++            )
++            assert len(tree_file_links) == 1
++
++        assert test_setup.compare_sandbox_and_expected_output()
+diff --git a/tests/unit/strictdoc/server/test_create_document_transaction.py b/tests/unit/strictdoc/server/test_create_document_transaction.py
+new file mode 100644
+index 000000000..613adb623
+--- /dev/null
++++ b/tests/unit/strictdoc/server/test_create_document_transaction.py
+@@ -0,0 +1,602 @@
++"""
++Unit tests for the recoverable create-document transaction.
++
++The tests inject a fake commit target (the ExportAction subset) so that
++index-build and export failures can be triggered deterministically.
++"""
++
++import os
++import tempfile
++from pathlib import Path
++from typing import List, Optional
++
++from strictdoc.backend.sdoc.writer import SDWriter
++from strictdoc.core.project_config import ProjectConfig
++from strictdoc.server.document_creation import (
++    CreateDocumentFailure,
++    CreateDocumentTransaction,
++)
++
++
++class FakeDocumentTree:
++    def __init__(self, document_list: List["FakeDocument"]) -> None:
++        self.document_list: List["FakeDocument"] = document_list
++
++
++class FakeIndex:
++    def __init__(
++        self, document_list: Optional[List["FakeDocument"]] = None
++    ) -> None:
++        self.document_tree = FakeDocumentTree(
++            document_list if document_list is not None else []
++        )
++        self.update_last_updated_calls = 0
++
++    def update_last_updated(self) -> None:
++        self.update_last_updated_calls += 1
++
++
++class FakeMeta:
++    def __init__(
++        self, input_doc_full_path: str, output_document_dir_full_path: str
++    ) -> None:
++        self.input_doc_full_path = input_doc_full_path
++        self.output_document_dir_full_path = (
++            output_document_dir_full_path
++        )
++
++    def _output_path(self, suffix: str) -> str:
++        return os.path.join(
++            self.output_document_dir_full_path,
++            f"document1{suffix}",
++        )
++
++    def get_html_doc_path(self) -> str:
++        return self._output_path(".html")
++
++    def get_html_table_path(self) -> str:
++        return self._output_path("-TABLE.html")
++
++    def get_html_traceability_path(self) -> str:
++        return self._output_path("-TRACE.html")
++
++    def get_html_deep_traceability_path(self) -> str:
++        return self._output_path("-DEEP-TRACE.html")
++
++    def get_html_pdf_path(self) -> str:
++        return self._output_path("-PDF.html")
++
++
++class FakeDocument:
++    def __init__(self, meta: FakeMeta) -> None:
++        self.meta = meta
++
++
++class FakeExportAction:
++    def __init__(
++        self,
++        *,
++        build_error: Optional[BaseException] = None,
++        export_errors: Optional[List[BaseException]] = None,
++        include_document_after_build: bool = False,
++        output_dir: Optional[str] = None,
++        document_full_path: Optional[str] = None,
++    ) -> None:
++        self.old_index = FakeIndex()
++        self.traceability_index = self.old_index
++        self.build_error = build_error
++        self.export_errors = export_errors if export_errors is not None else []
++        self.build_calls = 0
++        self.export_calls = 0
++        self._include_document_after_build = include_document_after_build
++        self._output_dir = output_dir
++        self._document_full_path = document_full_path
++
++    def build_index(self) -> FakeIndex:
++        self.build_calls += 1
++        if self.build_error is not None:
++            raise self.build_error
++        document_list: List[FakeDocument] = []
++        if self._include_document_after_build:
++            assert self._document_full_path is not None
++            assert self._output_dir is not None
++            document_list.append(
++                FakeDocument(
++                    FakeMeta(
++                        input_doc_full_path=self._document_full_path,
++                        output_document_dir_full_path=self._output_dir,
++                    )
++                )
++            )
++        self.traceability_index = FakeIndex(document_list)
++        return self.traceability_index
++
++    def export(self) -> None:
++        self.export_calls += 1
++        if len(self.export_errors) > 0:
++            raise self.export_errors.pop(0)
++
++
++class FakeWatcher:
++    def __init__(self) -> None:
++        self.inhibited_paths: List[str] = []
++
++    def inhibit_next_change(self, path: str) -> None:
++        self.inhibited_paths.append(path)
++
++
++def _create_project_config(input_root: str) -> ProjectConfig:
++    project_config = ProjectConfig.default_config()
++    project_config.input_paths = [input_root]
++    return project_config
++
++
++def _create_transaction(
++    *,
++    input_root: str,
++    export_action: FakeExportAction,
++    watcher: Optional[FakeWatcher] = None,
++) -> CreateDocumentTransaction:
++    project_config = _create_project_config(input_root)
++    return CreateDocumentTransaction(
++        project_config=project_config,
++        export_action=export_action,
++        sdoc_writer=SDWriter(project_config),
++        document_watcher=watcher,
++    )
++
++
++def test_001_create_lands_source_file_and_commits():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = os.path.join(temp_dir, "input")
++        os.mkdir(input_root)
++        export_action = FakeExportAction(
++            include_document_after_build=True,
++            document_full_path=os.path.join(
++                input_root, "docs", "document1.sdoc"
++            ),
++            output_dir=os.path.join(temp_dir, "output"),
++        )
++        watcher = FakeWatcher()
++        transaction = _create_transaction(
++            input_root=input_root,
++            export_action=export_action,
++            watcher=watcher,
++        )
++
++        result = transaction.create(
++            document_title="Document 1",
++            document_path="docs/document1.sdoc",
++        )
++
++        assert result.recovered is False
++        assert os.path.isfile(result.document_full_path)
++        with open(result.document_full_path, encoding="utf8") as document_file:
++            assert (
++                document_file.read()
++                == "[DOCUMENT]\nTITLE: Document 1\n"
++            )
++        assert export_action.build_calls == 1
++        assert export_action.export_calls == 1
++        assert watcher.inhibited_paths == [result.document_full_path]
++        assert not list(
++            Path(input_root).rglob("*.tmp")
++        )
++
++
++def test_002_resubmitting_same_form_adopts_file_without_duplicate():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = os.path.join(temp_dir, "input")
++        os.mkdir(input_root)
++        document_full_path = os.path.join(
++            input_root, "docs", "document1.sdoc"
++        )
++        export_action = FakeExportAction(
++            include_document_after_build=True,
++            document_full_path=document_full_path,
++            output_dir=os.path.join(temp_dir, "output"),
++        )
++        transaction = _create_transaction(
++            input_root=input_root,
++            export_action=export_action,
++        )
++
++        first_result = transaction.create(
++            document_title="Document 1",
++            document_path="docs/document1.sdoc",
++        )
++        with open(
++            first_result.document_full_path, encoding="utf8"
++        ) as document_file:
++            content_after_first_create = document_file.read()
++
++        second_result = transaction.create(
++            document_title="Document 1",
++            document_path="docs/document1.sdoc",
++        )
++
++        assert second_result.recovered is True
++        assert (
++            second_result.document_full_path
++            == first_result.document_full_path
++        )
++        with open(
++            second_result.document_full_path, encoding="utf8"
++        ) as document_file:
++            assert (
++                document_file.read() == content_after_first_create
++            )
++        assert export_action.build_calls == 2
++        assert export_action.export_calls == 2
++        assert (
++            list(Path(input_root).rglob("*.sdoc"))
++            == [Path(document_full_path)]
++        )
++
++
++def test_003_existing_document_with_content_is_not_overwritten():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        existing_path = input_root / "docs" / "document1.sdoc"
++        existing_path.parent.mkdir()
++        existing_content = (
++            "[DOCUMENT]\n"
++            "TITLE: Document 1\n\n"
++            "[REQUIREMENT]\n"
++            "UID: REQ-001\n"
++            "STATEMENT: Existing content.\n"
++        )
++        existing_path.write_text(existing_content, encoding="utf8")
++
++        export_action = FakeExportAction()
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="docs/document1.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure as failure:
++            raised = True
++            assert failure.field_name == "document_path"
++            assert "already exists" in failure.message
++
++        assert raised is True
++        assert (
++            existing_path.read_text(encoding="utf8")
++            == existing_content
++        )
++        assert export_action.build_calls == 0
++        assert export_action.export_calls == 0
++
++
++def test_004_existing_file_with_different_title_is_rejected():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        existing_path = input_root / "document1.sdoc"
++        existing_path.write_text(
++            "[DOCUMENT]\nTITLE: Another title\n",
++            encoding="utf8",
++        )
++
++        export_action = FakeExportAction()
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="document1.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure as failure:
++            raised = True
++            assert failure.field_name == "document_path"
++
++        assert raised is True
++        assert "Another title" in existing_path.read_text(
++            encoding="utf8"
++        )
++
++
++def test_005_unparseable_existing_file_is_rejected_and_kept():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        existing_path = input_root / "document1.sdoc"
++        broken_content = "this is not an sdoc document\n"
++        existing_path.write_text(broken_content, encoding="utf8")
++
++        export_action = FakeExportAction()
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="document1.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure:
++            raised = True
++
++        assert raised is True
++        assert (
++            existing_path.read_text(encoding="utf8") == broken_content
++        )
++        assert export_action.build_calls == 0
++
++
++def test_006_write_failure_removes_everything_created():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        # A regular file blocks the creation of a directory with the
++        # same name, which makes Path.mkdir fail with OSError.
++        blocker_path = input_root / "blocker"
++        blocker_path.write_text("x", encoding="utf8")
++
++        export_action = FakeExportAction()
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="blocker/document1.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure as failure:
++            raised = True
++            assert failure.field_name == "document_path"
++            assert "could not be created" in failure.message
++
++        assert raised is True
++        assert blocker_path.read_text(encoding="utf8") == "x"
++        assert export_action.build_calls == 0
++        assert export_action.export_calls == 0
++        assert not list(input_root.rglob("*.tmp"))
++
++
++def test_007_build_failure_rolls_back_landed_file_and_index():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        document_full_path = str(
++            input_root / "docs" / "document1.sdoc"
++        )
++        export_action = FakeExportAction(
++            build_error=RuntimeError("index boom"),
++        )
++        watcher = FakeWatcher()
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++            watcher=watcher,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="docs/document1.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure as failure:
++            raised = True
++            assert "project index" in failure.message
++
++        assert raised is True
++        assert not os.path.exists(document_full_path)
++        assert not (input_root / "docs").exists()
++        assert export_action.traceability_index is export_action.old_index
++        assert export_action.export_calls == 0
++        # One inhibition for the landing write and one for the rollback
++        # deletion.
++        assert watcher.inhibited_paths == [
++            document_full_path,
++            document_full_path,
++        ]
++
++        # After the cause is fixed, a deterministic retry succeeds.
++        export_action.build_error = None
++        export_action._include_document_after_build = True
++        export_action._document_full_path = document_full_path
++        export_action._output_dir = str(
++            Path(temp_dir) / "output"
++        )
++        result = transaction.create(
++            document_title="Document 1",
++            document_path="docs/document1.sdoc",
++        )
++        assert result.recovered is False
++        assert os.path.isfile(document_full_path)
++        assert export_action.build_calls == 2
++        assert export_action.export_calls == 1
++
++
++def test_008_build_failure_with_system_exit_is_recovered():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        document_full_path = str(
++            input_root / "document1.sdoc"
++        )
++        export_action = FakeExportAction(
++            build_error=SystemExit(1),
++        )
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="document1.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure:
++            raised = True
++
++        assert raised is True
++        assert not os.path.exists(document_full_path)
++        assert (
++            export_action.traceability_index is export_action.old_index
++        )
++
++
++def test_009_export_failure_keeps_valid_source_and_restores_index():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        output_dir = Path(temp_dir) / "output" / "docs"
++        output_dir.mkdir(parents=True)
++        document_full_path = str(
++            input_root / "docs" / "document1.sdoc"
++        )
++        # Simulate derived outputs produced before the export failure.
++        derived_html = output_dir / "document1.html"
++        derived_trace = output_dir / "document1-TRACE.html"
++        derived_html.write_text("html", encoding="utf8")
++        derived_trace.write_text("trace", encoding="utf8")
++
++        export_action = FakeExportAction(
++            export_errors=[RuntimeError("export boom")],
++            include_document_after_build=True,
++            document_full_path=document_full_path,
++            output_dir=str(output_dir),
++        )
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="docs/document1.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure as failure:
++            raised = True
++            assert "derived outputs" in failure.message
++
++        assert raised is True
++        # The valid source document is kept for recovery.
++        assert os.path.isfile(document_full_path)
++        # The index is restored, and screens are forced to regenerate.
++        assert (
++            export_action.traceability_index is export_action.old_index
++        )
++        assert (
++            export_action.old_index.update_last_updated_calls == 1
++        )
++        # The failed attempt's derived outputs are removed.
++        assert not derived_html.exists()
++        assert not derived_trace.exists()
++        # The repair export ran after the failed attempt.
++        assert export_action.export_calls == 2
++
++        # The retry adopts the kept file and commits successfully.
++        result = transaction.create(
++            document_title="Document 1",
++            document_path="docs/document1.sdoc",
++        )
++        assert result.recovered is True
++        assert export_action.build_calls == 2
++        assert export_action.export_calls == 3
++
++
++def test_010_export_failure_after_adoption_keeps_preexisting_file():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        document_full_path = input_root / "document1.sdoc"
++        document_full_path.write_text(
++            "[DOCUMENT]\nTITLE: Document 1\n",
++            encoding="utf8",
++        )
++        content_before = document_full_path.read_bytes()
++
++        export_action = FakeExportAction(
++            export_errors=[RuntimeError("export boom")],
++        )
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="document1.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure:
++            raised = True
++
++        assert raised is True
++        assert document_full_path.read_bytes() == content_before
++
++
++def test_011_markdown_document_is_idempotent_on_resubmit():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        export_action = FakeExportAction()
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        result = transaction.create(
++            document_title="Document 1",
++            document_path="docs/document1.md",
++        )
++        assert result.recovered is False
++        with open(result.document_full_path, encoding="utf8") as md_file:
++            assert md_file.read() == "# Document 1\n"
++
++        recovered_result = transaction.create(
++            document_title="Document 1",
++            document_path="docs/document1.md",
++        )
++        assert recovered_result.recovered is True
++        assert export_action.build_calls == 2
++
++
++def test_012_path_escaping_input_root_is_rejected():
++    with tempfile.TemporaryDirectory() as temp_dir:
++        input_root = Path(temp_dir) / "input"
++        input_root.mkdir()
++        export_action = FakeExportAction()
++        transaction = _create_transaction(
++            input_root=str(input_root),
++            export_action=export_action,
++        )
++
++        try:
++            transaction.create(
++                document_title="Document 1",
++                document_path="../escape.sdoc",
++            )
++            raised = False
++        except CreateDocumentFailure as failure:
++            raised = True
++            assert failure.field_name == "document_path"
++
++        assert raised is True
++        assert not (Path(temp_dir) / "escape.sdoc").exists()
++        assert export_action.build_calls == 0

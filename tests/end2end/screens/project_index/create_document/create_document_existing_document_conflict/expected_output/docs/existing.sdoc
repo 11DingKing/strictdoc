@@ -1,0 +1,9 @@
+[DOCUMENT]
+TITLE: Existing document
+
+[REQUIREMENT]
+UID: REQ-EXISTING-001
+TITLE: Existing requirement
+STATEMENT: >>>
+This requirement already exists and must not be lost.
+<<<

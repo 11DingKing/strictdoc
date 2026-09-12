@@ -50,6 +50,25 @@ releases:
 <<<
 
 [[SECTION]]
+MID: 7a8b9c0d1e2f30415263748596a7b8c9
+TITLE: Unreleased
+
+[TEXT]
+MID: 8b9c0d1e2f30415263748596a7b8c9d0
+STATEMENT: >>>
+This release contains the following enhancements:
+
+1\) Fixed: creating a document in the Web UI is now a recoverable
+operation. If the index rebuild or the HTML/PDF export fails after the
+source file is written, StrictDoc reports the error, rolls the partial
+creation back, and keeps the index consistent with disk. Submitting the
+same form again finishes the same document without a duplicate, and
+existing documents are never overwritten.
+<<<
+
+[[/SECTION]]
+
+[[SECTION]]
 MID: 5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e
 TITLE: 0.29.0 (2026-08-30)
 
