@@ -1,8 +1,7 @@
-项目：strictdoc-project-strictdoc-6fe9e954-4c53-4fc3-ad4a-5caf9ee49da7
+项目：strictdoc-project-strictdoc-6fe9e954-4c53-4fc3-ad4a-5caf9ee49da7｜验证：8 passed
 Rubric ID：1｜状态：通过｜期望行为：路径、标题和可编辑扩展名校验失败时不创建目录、源文件或索引节点并返回表单错误｜实际观察：路由在事务前执行标题、路径、include/exclude 与扩展名校验；错误时直接返回 200 Turbo 表单响应｜直接证据：strictdoc/server/routers/main_router.py:3218-3319
 Rubric ID：2｜状态：未通过｜期望行为：写入、索引或导出失败不返回成功且文件、目录、GraphDatabase 和项目树可清理或恢复｜实际观察：新增文件和索引失败会回滚；导出失败恢复阶段的索引重建、删除输出和再次导出异常仅打印日志后返回原失败，清理失败未向主流程报告｜直接证据：strictdoc/server/document_creation.py:140-165,355-403｜原因：恢复清理异常被 print 吞掉｜影响：恢复失败时项目树或派生输出可保持不一致，接口无法证明已恢复｜证据位置：strictdoc/server/document_creation.py:385-403
 Rubric ID：3｜状态：通过｜期望行为：修复失败后重试只处理原目标且不产生重复文档、UID/MID 或陈旧页面｜实际观察：同标题空文档被识别为 recovered，重试采用已有文件并重新构建索引；单元测试验证失败后重试仅有一个文档｜直接证据：strictdoc/server/document_creation.py:253-283；tests/unit/strictdoc/server/test_document_creation.py:122-170
 Rubric ID：4｜状态：未通过｜期望行为：成功后源文档、索引、搜索、项目树和 HTML/PDF 观察到同一状态且重启后一致｜实际观察：成功路径在索引交换后调用 export；但导出失败恢复再次 export 异常仅记录日志，且未提供重启一致性验证｜直接证据：strictdoc/server/document_creation.py:346-353,369-403｜原因：派生输出恢复失败不传播且重启场景无可复现验证｜影响：HTML/PDF 与索引状态在恢复失败时不一致｜证据位置：strictdoc/server/document_creation.py:395-403
 Rubric ID：5｜状态：通过｜期望行为：include/exclude、确认响应、扩展名和标题规范保持兼容｜实际观察：原有 PathFilter、扩展名和表单错误分支保留，事务仅替换成功写回段｜直接证据：strictdoc/server/routers/main_router.py:3220-3319
 Rubric ID：6｜状态：通过｜期望行为：重复提交、路径冲突、已有文档和自动生成内容不误删或改写原文件｜实际观察：预检拒绝不同内容的已有路径；同内容空文档走 already_present；回滚只删除本次创建文件和空目录｜直接证据：strictdoc/server/document_creation.py:253-283,355-367；tests/unit/strictdoc/server/test_document_creation.py:76-121
-验证摘要：build/uv/check/bin/python -m pytest -q tests/unit/strictdoc/server/test_document_creation.py -p no:cacheprovider -> 8 passed；编译检查通过。
